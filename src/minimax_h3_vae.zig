@@ -212,15 +212,21 @@ pub const TilePlan = struct {
 };
 
 pub fn splitTiles(allocator: std.mem.Allocator, input_len: u32) !TilePlan {
-    if (TILE_SIZE >= input_len) {
+    return splitTilesSized(allocator, input_len, TILE_SIZE);
+}
+
+/// `splitTiles` with a tile length other than the reference's. Only the
+/// draft+touch-up re-encode asks for one (see `Encoder.tile`).
+pub fn splitTilesSized(allocator: std.mem.Allocator, input_len: u32, tile: u32) !TilePlan {
+    if (tile >= input_len) {
         const starts = try allocator.alloc(u32, 1);
         starts[0] = 0;
         return .{ .starts = starts, .overlaps = try allocator.alloc(u32, 0), .len = input_len, .allocator = allocator };
     }
-    var n: u32 = (input_len + TILE_SIZE - 1) / TILE_SIZE;
+    var n: u32 = (input_len + tile - 1) / tile;
     var remaining: i64 = 0;
     while (true) {
-        remaining = @as(i64, TILE_SIZE) * n - @as(i64, TILE_OVERLAP_MIN) * (n - 1) - @as(i64, input_len);
+        remaining = @as(i64, tile) * n - @as(i64, TILE_OVERLAP_MIN) * (n - 1) - @as(i64, input_len);
         if (remaining < 0) n += 1 else break;
     }
     const overlaps = try allocator.alloc(u32, n - 1);
@@ -232,8 +238,8 @@ pub fn splitTiles(allocator: std.mem.Allocator, input_len: u32) !TilePlan {
     const starts = try allocator.alloc(u32, n);
     errdefer allocator.free(starts);
     starts[0] = 0;
-    for (0..n - 1) |i| starts[i + 1] = starts[i] + TILE_SIZE - overlaps[i];
-    return .{ .starts = starts, .overlaps = overlaps, .len = TILE_SIZE, .allocator = allocator };
+    for (0..n - 1) |i| starts[i + 1] = starts[i] + tile - overlaps[i];
+    return .{ .starts = starts, .overlaps = overlaps, .len = tile, .allocator = allocator };
 }
 
 // ── mlx helpers ─────────────────────────────────────────────────────────────
@@ -392,6 +398,12 @@ pub const Decoder = struct {
     pq_b: mlx.mlx_array,
     latents_mean: mlx.mlx_array,
     latents_std: mlx.mlx_array,
+    /// Compute dtype and spatial tile length. f32 / TILE_SIZE is the
+    /// reference path every conditioning encode takes; `loadAs` lets the
+    /// draft+touch-up re-encode trade both for speed (its output is noised to
+    /// sigma ~0.8-0.9 straight away, so seams and low bits don't survive).
+    dt: mlx.mlx_dtype = mlx.mlx_dtype.float32,
+    tile: u32 = TILE_SIZE,
 
     pub fn load(allocator: std.mem.Allocator, w: *const Weights, cfg: DecCfg, dt: mlx.mlx_dtype, s: S) !Decoder {
         var self: Decoder = undefined;
@@ -1363,6 +1375,9 @@ const EncLevel = struct {
     }
 };
 
+/// Weight dtype `Encoder.load` casts to; `loadAs` sets it for one load.
+var enc_load_dtype: mlx.mlx_dtype = mlx.mlx_dtype.float32;
+
 pub const Encoder = struct {
     allocator: std.mem.Allocator,
     conv_in_w: mlx.mlx_array,
@@ -1376,6 +1391,12 @@ pub const Encoder = struct {
     quant_b: mlx.mlx_array,
     latents_mean: mlx.mlx_array,
     latents_std: mlx.mlx_array,
+    /// Compute dtype and spatial tile length. f32 / TILE_SIZE is the
+    /// reference path every conditioning encode takes; `loadAs` lets the
+    /// draft+touch-up re-encode trade both for speed (its output is noised to
+    /// sigma ~0.8-0.9 straight away, so seams and low bits don't survive).
+    dt: mlx.mlx_dtype = mlx.mlx_dtype.float32,
+    tile: u32 = TILE_SIZE,
 
     /// [O, I, kt, kh, kw] -> f32 [O, kt, kh, kw, I], the layout mlx_conv3d
     /// wants. Kept in FULL (not tap-truncated) so one weight set serves both
@@ -1389,7 +1410,7 @@ pub const Encoder = struct {
         defer _ = mlx.mlx_array_free(tr);
         const trc = try contig(tr, s);
         defer _ = mlx.mlx_array_free(trc);
-        return astype(trc, mlx.mlx_dtype.float32, s);
+        return astype(trc, enc_load_dtype, s);
     }
 
     fn vec1(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8, args: anytype, s: S) !mlx.mlx_array {
@@ -1397,7 +1418,7 @@ pub const Encoder = struct {
         defer a.free(name);
         const raw = try ownWeight(w, name);
         defer _ = mlx.mlx_array_free(raw);
-        return astype(raw, mlx.mlx_dtype.float32, s);
+        return astype(raw, enc_load_dtype, s);
     }
 
     /// 1x1x1 conv weight [O, I, 1, 1, 1] -> pre-transposed f32 [I, O].
@@ -1413,12 +1434,25 @@ pub const Encoder = struct {
         defer _ = mlx.mlx_array_free(tr);
         const trc = try contig(tr, s);
         defer _ = mlx.mlx_array_free(trc);
-        return astype(trc, mlx.mlx_dtype.float32, s);
+        return astype(trc, enc_load_dtype, s);
+    }
+
+    /// `load` at another compute dtype and tile length — the draft+touch-up
+    /// re-encode only; see the `dt` field.
+    pub fn loadAs(allocator: std.mem.Allocator, w: *const Weights, dt: mlx.mlx_dtype, tile: u32, s: S) !Encoder {
+        enc_load_dtype = dt;
+        defer enc_load_dtype = mlx.mlx_dtype.float32;
+        var e = try load(allocator, w, s);
+        e.dt = dt;
+        e.tile = tile;
+        return e;
     }
 
     pub fn load(allocator: std.mem.Allocator, w: *const Weights, s: S) !Encoder {
         var self: Encoder = undefined;
         self.allocator = allocator;
+        self.dt = enc_load_dtype;
+        self.tile = TILE_SIZE;
         self.conv_in_w = try convTap(w, allocator, "encoder.conv_in.weight", .{}, s);
         self.conv_in_b = try vec1(w, allocator, "encoder.conv_in.bias", .{}, s);
         for (0..ENC_LEVELS) |lv| {
@@ -1605,10 +1639,14 @@ pub const Encoder = struct {
         const nthwc = try divA(cen, psd, s);
         defer _ = mlx.mlx_array_free(nthwc);
 
-        const moments = if (pt == 1)
-            try self.adaptiveEncode(nthwc, ph, pw, alloc, s)
+        const xin = try astype(nthwc, self.dt, s);
+        defer _ = mlx.mlx_array_free(xin);
+        const moments_dt = if (pt == 1)
+            try self.adaptiveEncode(xin, ph, pw, alloc, s)
         else
-            try self.encodeTemporal(nthwc, pt, ph, pw, alloc, s);
+            try self.encodeTemporal(xin, pt, ph, pw, alloc, s);
+        defer _ = mlx.mlx_array_free(moments_dt);
+        const moments = try astype(moments_dt, mlx.mlx_dtype.float32, s);
         defer _ = mlx.mlx_array_free(moments);
 
         // mean = first 24 channels; normalize by the latent statistics.
@@ -1626,7 +1664,7 @@ pub const Encoder = struct {
 
     /// Single pass or spatially tiled, per the reference's `_adaptive_encode`.
     fn adaptiveEncode(self: *const Encoder, x: mlx.mlx_array, ph: u32, pw: u32, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
-        if (fitsSingleTile(ph) and fitsSingleTile(pw)) return self.encodeMoments(x, s);
+        if (self.tile >= ph and self.tile >= pw) return self.encodeMoments(x, s);
         return self.encodeTiled(x, alloc, s);
     }
 
@@ -1681,9 +1719,9 @@ pub const Encoder = struct {
         const shp = mlx.getShape(nhwc);
         const ph: u32 = @intCast(shp[2]);
         const pw: u32 = @intCast(shp[3]);
-        var yp = try splitTiles(alloc, ph);
+        var yp = try splitTilesSized(alloc, ph, self.tile);
         defer yp.deinit();
-        var xp = try splitTiles(alloc, pw);
+        var xp = try splitTilesSized(alloc, pw, self.tile);
         defer xp.deinit();
         const ny = yp.count();
         const nx = xp.count();

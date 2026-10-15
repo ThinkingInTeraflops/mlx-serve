@@ -3950,6 +3950,29 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     if (chain_windows > 1 and engine.supports_refs)
         return sendError(conn, 400, "chained windows ride FL2VA keyframe conditioning — the REF2VA pack cannot serve them; load an FL2VA checkpoint");
 
+    // Draft + touch-up: `"pipeline": "draft_refine"` samples the whole
+    // schedule on a smaller canvas and only the last steps at this one (see
+    // `minimax_h3.generateDraftRefine`). Refused with chained windows and
+    // references by name — both size themselves off the target canvas.
+    var draft_scale: f64 = 0;
+    var refine_steps: u32 = 0;
+    if (extractJsonString(body, "pipeline")) |pl| {
+        if (std.mem.eql(u8, pl, "draft_refine")) {
+            draft_scale = extractJsonFloat(body, "draft_scale") orelse 0.65;
+            if (!(draft_scale >= 0.3 and draft_scale <= 0.95))
+                return sendError(conn, 400, "draft_scale must be 0.3-0.95 (the draft canvas per side)");
+            refine_steps = @intCast(extractJsonInt(body, "refine_steps") orelse 0);
+            if (refine_steps >= steps)
+                return sendError(conn, 400, "refine_steps must be below steps (0 = auto, 30% of the schedule)");
+            if (chain_windows > 1)
+                return sendError(conn, 400, "draft_refine can't run with chain_windows: each window's keyframe is the previous window's full-size frame");
+            if (engine.supports_refs)
+                return sendError(conn, 400, "draft_refine runs on the FL2VA pack only: references size themselves off the target canvas");
+        } else if (!std.mem.eql(u8, pl, "one_stage")) {
+            return sendError(conn, 400, "MiniMax-H3 'pipeline' must be \"one_stage\" or \"draft_refine\"");
+        }
+    }
+
     // Snap to the model's own ladder and SAY SO: silently generating a
     // different length than asked is how a client's audio mux drifts.
     const shape = minimax_h3.temporalShape(requested_frames);
@@ -4113,6 +4136,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .chain_windows = chain_windows,
         .keyframes = keyframes_buf[0..n_kf],
         .refs = refs.items,
+        .draft_scale = draft_scale,
+        .refine_steps = refine_steps,
     }, prog, mlx.gpuStream()) catch |e| {
         // Client hung up mid-generation — there is nobody to answer, and
         // saying "generation failed" would be a lie about a job we stopped.

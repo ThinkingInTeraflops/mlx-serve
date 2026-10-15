@@ -3571,6 +3571,22 @@ pub const GenRequest = struct {
     /// blocks: a reference has no cond row of its own competing with the tower,
     /// and the prompt addresses it as `<Picture i>` / `<Video k>` / `<Audio j>`.
     refs: []const RefMedia = &.{},
+    /// Draft + touch-up ("pipeline": "draft_refine"): the whole schedule on a
+    /// canvas `draft_scale` times the size per side, a lanczos upscale of the
+    /// decoded draft, then only the last `refine_steps` steps at the real
+    /// canvas — see `generateDraftRefine`. 0 = off. `refine_steps` 0 = auto
+    /// (30% of the schedule).
+    draft_scale: f64 = 0,
+    refine_steps: u32 = 0,
+    /// Set by `generateDraftRefine` for the touch-up pass, never by a client:
+    /// start the schedule at step `init_start` from `init_pixels` ([1,3,F,H,W]
+    /// in [-1,1] at THIS canvas), noised to that step's sigma. When
+    /// `init_audio_latent` ([1,32,2,audio_t]) is set it seeds the audio stream
+    /// the same way and is delivered as-is, so the touch-up cannot move the
+    /// lips off the draft's sound. Caller owns both arrays.
+    init_pixels: ?mlx.mlx_array = null,
+    init_audio_latent: ?mlx.mlx_array = null,
+    init_start: u32 = 0,
 };
 
 pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };
@@ -3885,6 +3901,13 @@ pub fn generate(
     progress: ?gen_sse.Progress,
     s: S,
 ) !GenResult {
+    if (req.draft_scale > 0 and req.init_pixels == null) {
+        // A chained window's keyframe is the previous window's full-size last
+        // frame, and a reference sizes itself off the target canvas; neither
+        // survives a draft canvas. The handler refuses both by name first.
+        if (req.chain_windows > 1 or req.refs.len > 0) return error.DraftRefineUnsupported;
+        return generateDraftRefine(allocator, io, paths, req, progress, s);
+    }
     if (req.chain_windows > 1) return generateChain(allocator, io, paths, req, progress, s);
     return generateOne(allocator, io, paths, req, progress, s);
 }
@@ -4119,6 +4142,35 @@ fn generateOne(
         });
     }
 
+    // ── 1.6 draft + touch-up: the upscaled draft -> target latent rows ──
+    var init_rows: ?mlx.mlx_array = null;
+    defer if (init_rows) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    if (req.init_pixels) |ip| {
+        if (req.init_start == 0 or req.init_start >= req.steps) return error.InitStartOutOfRange;
+        var vw0 = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
+        defer vw0.deinit();
+        // The re-encode is the round trip's big cost (11.5 min of a 55 min
+        // 720p run on an M1 Max at the reference f32 / 256-px tiles), and its
+        // output is noised to the start sigma at once — see `Encoder.dt`.
+        const enc_cfg = refineEncoderConfig();
+        var ienc = try vae_mod.Encoder.loadAs(allocator, &vw0, enc_cfg.dt, enc_cfg.tile, s);
+        defer ienc.deinit();
+        const lat = try ienc.encodeVideo(ip, allocator, s);
+        defer _ = mlx.mlx_array_free(lat);
+        const lshp = mlx.getShape(lat);
+        if (@as(u32, @intCast(lshp[2])) != shape.latent_t or
+            @as(u32, @intCast(lshp[3])) != lat_h or
+            @as(u32, @intCast(lshp[4])) != lat_w) return error.InitLatentShapeMismatch;
+        init_rows = try patchifyVideo(lat, s);
+        try mlx.check(mlx.mlx_array_eval(init_rows.?));
+        _ = mlx.mlx_clear_cache();
+        log.info("[minimax-h3] touch-up: draft re-encoded at {d}x{d}, starting at step {d}/{d} ({d} ms, encoder released)\n", .{
+            req.width, req.height, req.init_start + 1, req.steps, phase_timer.lapMs(),
+        });
+    }
+
     if (progress) |p| p.emit("Encoding prompt", 0, req.steps);
 
     // ── 2. presentation: "<Picture i>: " + vision block per keyframe, then the
@@ -4319,6 +4371,26 @@ fn generateOne(
     const sigmas = try sigmaSchedule(allocator, req.steps, req.shift_video);
     defer allocator.free(sigmas);
 
+    // Touch-up: the flow-matching forward process at the start step,
+    // x = (1 - sigma) * x0 + sigma * noise, reusing the noise just drawn so a
+    // seed still reproduces. The audio stream sits at its own clock's sigma.
+    if (init_rows) |x0| {
+        const sk = sigmas[req.init_start];
+        const nv = try blendToSigma(video_x, x0, sk, s);
+        _ = mlx.mlx_array_free(video_x);
+        video_x = nv;
+        if (req.init_audio_latent) |al| {
+            const a0 = try audioLatentToRows(al, s);
+            defer _ = mlx.mlx_array_free(a0);
+            const na = try blendToSigma(audio_x, a0, timeShiftSigma(sk, req.shift_video, req.shift_audio), s);
+            _ = mlx.mlx_array_free(audio_x);
+            audio_x = na;
+        }
+        try mlx.check(mlx.mlx_array_eval(video_x));
+        try mlx.check(mlx.mlx_array_eval(audio_x));
+        log.info("[minimax-h3] touch-up: latents noised to sigma {d:.4}\n", .{sk});
+    }
+
     // Profiling arms: never set by any server path; the live-test harness and
     // profile drivers own the env. A non-empty junk value is LOUDLY off.
     const abl_raw = envStr("MINIMAX_H3_ABLATE");
@@ -4437,6 +4509,8 @@ fn generateOne(
         }
 
         for (0..req.steps) |i| {
+            // Touch-up: the draft already walked these.
+            if (i < req.init_start) continue;
             model.ablate = switch (abl_mode) {
                 .off => .none,
                 .ladder => ladderArmForStep(i),
@@ -4611,7 +4685,12 @@ fn generateOne(
     _ = mlx.mlx_clear_cache();
     log.info("[minimax-h3] video decoded in {d} ms (load+decode)\n", .{phase_timer.lapMs()});
 
-    const audio_latent = try audioRowsToLatent(audio_x, shape.audio_t, s);
+    // A touch-up delivers the draft's soundtrack untouched: it only refined the
+    // picture, and re-sampled audio could drift off the draft's lip timing.
+    const audio_latent = if (req.init_audio_latent) |al|
+        try contig(al, s)
+    else
+        try audioRowsToLatent(audio_x, shape.audio_t, s);
     errdefer _ = mlx.mlx_array_free(audio_latent);
 
     // ── 5. audio VAE (optional) ──
@@ -4636,6 +4715,243 @@ fn generateOne(
         .height = @intCast(pshape[3]),
         .width = @intCast(pshape[4]),
     };
+}
+
+// ── Draft + touch-up ────────────────────────────────────────────────────────
+
+/// The touch-up re-encode's dtype and tile length. Env wins for A/B runs
+/// (`MINIMAX_H3_REFINE_ENC_DTYPE` = f32|bf16|f16, `MINIMAX_H3_REFINE_ENC_TILE`
+/// = pixels, a multiple of 16 >= 256); the defaults are the measured choice.
+pub const RefineEncoderConfig = struct { dt: mlx.mlx_dtype, tile: u32 };
+// Measured on an M1 Max (22 real 1312x736 frames, warm): f32/512 encodes in
+// 137 s against the reference f32/256's 171 s (1.25x) and round-trips at
+// 36.98 dB PSNR against 37.52. f32/768 is slower again (157 s), bf16 gains
+// nothing on M1 (no native bf16) and f16 overflows to NaN.
+pub const REFINE_ENC_DEFAULT: RefineEncoderConfig = .{ .dt = mlx.mlx_dtype.float32, .tile = 512 };
+
+fn refineEncoderConfig() RefineEncoderConfig {
+    var cfg = REFINE_ENC_DEFAULT;
+    if (envStr("MINIMAX_H3_REFINE_ENC_DTYPE")) |v| {
+        if (std.mem.eql(u8, v, "f32")) cfg.dt = mlx.mlx_dtype.float32
+        else if (std.mem.eql(u8, v, "bf16")) cfg.dt = mlx.mlx_dtype.bfloat16
+        else if (std.mem.eql(u8, v, "f16")) cfg.dt = mlx.mlx_dtype.float16
+        else log.warn("[minimax-h3] MINIMAX_H3_REFINE_ENC_DTYPE='{s}' not recognized (f32|bf16|f16)\n", .{v});
+    }
+    if (envStr("MINIMAX_H3_REFINE_ENC_TILE")) |v| {
+        const t = std.fmt.parseInt(u32, v, 10) catch 0;
+        if (t >= 256 and t % 16 == 0) cfg.tile = t else log.warn("[minimax-h3] MINIMAX_H3_REFINE_ENC_TILE='{s}' ignored (a multiple of 16, at least 256)\n", .{v});
+    }
+    return cfg;
+}
+
+/// (1 - sigma) * x0 + sigma * noise — the rectified-flow forward process the
+/// sampler integrates backwards. New array; the caller frees both inputs.
+fn blendToSigma(noise: mlx.mlx_array, x0: mlx.mlx_array, sigma: f64, s: S) !mlx.mlx_array {
+    const keep = try scalarLike(@floatCast(1.0 - sigma), x0, s);
+    defer _ = mlx.mlx_array_free(keep);
+    const amt = try scalarLike(@floatCast(sigma), noise, s);
+    defer _ = mlx.mlx_array_free(amt);
+    const a = try mulA(x0, keep, s);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try mulA(noise, amt, s);
+    defer _ = mlx.mlx_array_free(b);
+    return addA(a, b, s);
+}
+
+/// One side of the draft canvas: scaled, then kept on an even latent grid so
+/// it stays a multiple of 32. Rounds halves UP, matching the clients that
+/// predict it (EtherReel's `h3DraftCanvas`).
+pub fn draftSide(px: u32, scale: f64) u32 {
+    const half_lat = @as(f64, @floatFromInt(px)) / 16.0 * scale / 2.0;
+    const n: u32 = @intFromFloat(@max(1.0, @floor(half_lat + 0.5)));
+    return n * 2 * 16;
+}
+
+/// The touch-up's share of a schedule: the request's count, or 30% of it
+/// (auto), always at least one step and short of the whole schedule.
+pub fn draftRefineSteps(requested: u32, steps: u32) u32 {
+    if (steps < 2) return 1;
+    const want: u32 = if (requested > 0)
+        requested
+    else
+        @intFromFloat(@floor(@as(f64, @floatFromInt(steps)) * 0.3 + 0.5));
+    return @max(1, @min(steps - 1, want));
+}
+
+fn lanczos3(x: f64) f64 {
+    const ax = @abs(x);
+    if (ax < 1e-8) return 1.0;
+    if (ax >= 3.0) return 0.0;
+    const px = std.math.pi * x;
+    return 3.0 * @sin(px) * @sin(px / 3.0) / (px * px);
+}
+
+/// The [out, in] lanczos-3 resampling matrix for one axis, rows summing to 1.
+/// A downscale stretches the kernel by in/out (antialiased), as PIL does.
+/// Caller frees.
+pub fn lanczosMatrix(allocator: std.mem.Allocator, in_n: u32, out_n: u32) ![]f32 {
+    const m = try allocator.alloc(f32, @as(usize, out_n) * in_n);
+    @memset(m, 0);
+    const scale = @as(f64, @floatFromInt(in_n)) / @as(f64, @floatFromInt(out_n));
+    const stretch = @max(1.0, scale);
+    const support = 3.0 * stretch;
+    for (0..out_n) |o| {
+        const center = (@as(f64, @floatFromInt(o)) + 0.5) * scale;
+        const lo: usize = @intFromFloat(@max(0.0, @floor(center - support)));
+        const hi: usize = @intFromFloat(@min(@as(f64, @floatFromInt(in_n)), @ceil(center + support)));
+        var sum: f64 = 0;
+        for (lo..hi) |x| sum += lanczos3((@as(f64, @floatFromInt(x)) + 0.5 - center) / stretch);
+        if (sum == 0) sum = 1;
+        for (lo..hi) |x| {
+            const w = lanczos3((@as(f64, @floatFromInt(x)) + 0.5 - center) / stretch) / sum;
+            m[o * in_n + x] = @floatCast(w);
+        }
+    }
+    return m;
+}
+
+fn matmulA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_matmul(&o, a, b, s));
+    return o;
+}
+
+/// [1, 3, T, h, w] -> [1, 3, T, H, W], lanczos-3 per frame as two GPU matmuls
+/// (W axis, then H axis), clamped back to [-1, 1] against ringing. A pixel
+/// round trip rather than a latent resize: the ComfyUI node this mirrors
+/// found a bilinear latent upscale left the touch-up too little to work with.
+pub fn resizeVideo(allocator: std.mem.Allocator, px: mlx.mlx_array, out_h: u32, out_w: u32, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(px);
+    const in_h: u32 = @intCast(shp[3]);
+    const in_w: u32 = @intCast(shp[4]);
+
+    const aw = try lanczosMatrix(allocator, in_w, out_w);
+    defer allocator.free(aw);
+    // Transposed to [in_w, out_w] so the frame matmul is x @ awT.
+    const awt = try allocator.alloc(f32, aw.len);
+    defer allocator.free(awt);
+    for (0..out_w) |o| for (0..in_w) |x| {
+        awt[x * out_w + o] = aw[o * in_w + x];
+    };
+    const ah = try lanczosMatrix(allocator, in_h, out_h);
+    defer allocator.free(ah);
+
+    const awt_shape = [_]c_int{ @intCast(in_w), @intCast(out_w) };
+    const awt_arr = mlx.mlx_array_new_data(awt.ptr, &awt_shape, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(awt_arr);
+    const ah_shape = [_]c_int{ @intCast(out_h), @intCast(in_h) };
+    const ah_arr = mlx.mlx_array_new_data(ah.ptr, &ah_shape, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(ah_arr);
+
+    const xf = try astype(px, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(xf);
+    const wide = try matmulA(xf, awt_arr, s); // [1,3,T,h,W]
+    defer _ = mlx.mlx_array_free(wide);
+    const tall = try matmulA(ah_arr, wide, s); // [1,3,T,H,W]
+    defer _ = mlx.mlx_array_free(tall);
+    const lo = try scalarLike(-1.0, tall, s);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = try scalarLike(1.0, tall, s);
+    defer _ = mlx.mlx_array_free(hi);
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_clip(&o, tall, lo, hi, s));
+    return o;
+}
+
+/// One progress bar across both passes: the draft's steps, then the
+/// touch-up's, labelled by pass.
+const DraftProgress = struct {
+    inner: gen_sse.Progress,
+    touch_up: bool,
+    steps: u32,
+    start: u32,
+
+    fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+        const self: *DraftProgress = @ptrCast(@alignCast(ptr));
+        var buf: [96]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, "{s}: {s}", .{ if (self.touch_up) "Touch-up" else "Draft", stage }) catch stage;
+        if (total == 0) return self.inner.emit(label, step, 0);
+        const all = self.steps + (self.steps - self.start);
+        const at = if (self.touch_up) self.steps + (step -| self.start) else step;
+        self.inner.emit(label, @min(at, all), all);
+    }
+    fn cancelledCb(ptr: *anyopaque) bool {
+        const self: *DraftProgress = @ptrCast(@alignCast(ptr));
+        return self.inner.cancelled();
+    }
+    fn progress(self: *DraftProgress) gen_sse.Progress {
+        return .{ .ctx = self, .cb = cb, .cancelled_cb = cancelledCb };
+    }
+};
+
+/// Draft + touch-up: the whole schedule on a `draft_scale` canvas — where
+/// motion, timing and the soundtrack are decided, at a fraction of the
+/// attention cost — then the decoded draft lanczos-upscaled to the real canvas
+/// and only the schedule's last `refine_steps` run there. The delivered audio
+/// is the draft's. Two staged `generateOne` runs, the same trade
+/// `generateChain` makes: the validated single-window path unchanged, at the
+/// cost of loading the TE and DiT twice.
+///
+/// The same seed gives a different shot than a native render (the noise is
+/// drawn at the draft canvas) and matches a native render AT the draft size.
+fn generateDraftRefine(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: GenPaths,
+    req: GenRequest,
+    progress: ?gen_sse.Progress,
+    s: S,
+) !GenResult {
+    const refine = draftRefineSteps(req.refine_steps, req.steps);
+    const start = req.steps - refine;
+    const dw = draftSide(req.width, req.draft_scale);
+    const dh = draftSide(req.height, req.draft_scale);
+    log.info("[minimax-h3] draft+touch-up: draft {d}x{d} over all {d} steps, then the last {d} at {d}x{d}\n", .{
+        dw, dh, req.steps, refine, req.width, req.height,
+    });
+
+    // Keyframes are at the target canvas; the draft needs them at its own.
+    var kf_buf: [2]Keyframe = undefined;
+    var kf_owned: [2]?mlx.mlx_array = .{ null, null };
+    defer for (kf_owned) |k| if (k) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (req.keyframes, 0..) |kf, i| {
+        const small = try resizeVideo(allocator, kf.pixels, dh, dw, s);
+        kf_owned[i] = small;
+        kf_buf[i] = .{ .anchor = kf.anchor, .pixels = small, .vision = null };
+    }
+
+    var dp: DraftProgress = .{ .inner = undefined, .touch_up = false, .steps = req.steps, .start = start };
+    var dprog: ?gen_sse.Progress = null;
+    if (progress) |p| {
+        dp.inner = p;
+        dprog = dp.progress();
+    }
+
+    var dreq = req;
+    dreq.width = dw;
+    dreq.height = dh;
+    dreq.draft_scale = 0;
+    dreq.keyframes = kf_buf[0..req.keyframes.len];
+    var draft = try generateOne(allocator, io, paths, dreq, dprog, s);
+    defer draft.deinit();
+
+    const up = try resizeVideo(allocator, draft.pixels, req.height, req.width, s);
+    defer _ = mlx.mlx_array_free(up);
+    try mlx.check(mlx.mlx_array_eval(up));
+    // The draft's pixels are no longer needed; its audio latent rides on.
+    _ = mlx.mlx_array_free(draft.pixels);
+    draft.pixels = mlx.mlx_array_new();
+    _ = mlx.mlx_clear_cache();
+
+    dp.touch_up = true;
+    var rreq = req;
+    rreq.draft_scale = 0;
+    rreq.init_pixels = up;
+    rreq.init_audio_latent = draft.audio_latent;
+    rreq.init_start = start;
+    return generateOne(allocator, io, paths, rreq, dprog, s);
 }
 
 // ── Chained windows ─────────────────────────────────────────────────────────
@@ -7412,4 +7728,174 @@ test "add_norm: fused gate + rmsnorm + modulation is bit-equal to modGate -> rms
         try expectBitEqual(got.normed, want, if (with_add) "gated norm+mod" else "norm+mod", s);
         if (with_add) try expectBitEqual(got.h, h1, "gated residual", s);
     }
+}
+
+test "minimax h3: draft canvas matches the clients' rounding and stays on the /32 grid" {
+    // Same table as EtherReel's `h3DraftCanvas`.
+    try std.testing.expectEqual(@as(u32, 864), draftSide(1344, 0.65));
+    try std.testing.expectEqual(@as(u32, 512), draftSide(768, 0.65));
+    try std.testing.expectEqual(@as(u32, 480), draftSide(736, 0.65));
+    try std.testing.expectEqual(@as(u32, 960), draftSide(1920, 0.5));
+    for ([_]f64{ 0.3, 0.55, 0.65, 0.95 }) |sc| for ([_]u32{ 256, 768, 1344, 2560 }) |px| {
+        try std.testing.expect(draftSide(px, sc) % 32 == 0);
+        try std.testing.expect(draftSide(px, sc) >= 32);
+    };
+}
+
+test "minimax h3: touch-up steps are auto 30% and never the whole schedule" {
+    try std.testing.expectEqual(@as(u32, 9), draftRefineSteps(0, 30));
+    try std.testing.expectEqual(@as(u32, 1), draftRefineSteps(0, 4));
+    try std.testing.expectEqual(@as(u32, 7), draftRefineSteps(7, 23));
+    try std.testing.expectEqual(@as(u32, 3), draftRefineSteps(99, 4));
+    try std.testing.expectEqual(@as(u32, 1), draftRefineSteps(0, 2));
+}
+
+test "minimax h3: lanczos rows sum to 1 and an identity resize is the identity" {
+    const a = std.testing.allocator;
+    for ([_][2]u32{ .{ 54, 84 }, .{ 84, 54 }, .{ 30, 30 } }) |io_| {
+        const m = try lanczosMatrix(a, io_[0], io_[1]);
+        defer a.free(m);
+        for (0..io_[1]) |o| {
+            var sum: f64 = 0;
+            for (0..io_[0]) |x| sum += m[o * io_[0] + x];
+            try std.testing.expectApproxEqAbs(@as(f64, 1.0), sum, 1e-5);
+        }
+    }
+    const id = try lanczosMatrix(a, 16, 16);
+    defer a.free(id);
+    for (0..16) |o| for (0..16) |x| {
+        try std.testing.expectApproxEqAbs(@as(f32, if (o == x) 1.0 else 0.0), id[o * 16 + x], 1e-6);
+    };
+}
+
+// Times the touch-up re-encode under each encoder config against the
+// reference f32 / 256-px path, on real frames. Live-only:
+//   MINIMAX_H3_ENC_BENCH=<video_vae.safetensors>  MINIMAX_H3_ENC_RAW=<rgb24 file>
+//   MINIMAX_H3_ENC_W / _H / _F = its geometry (F on the 17k+5 ladder)
+test "minimax h3 live: touch-up encoder configs (speed vs reference)" {
+    const vae_path = envStr("MINIMAX_H3_ENC_BENCH") orelse return error.SkipZigTest;
+    const raw_path = envStr("MINIMAX_H3_ENC_RAW") orelse return error.SkipZigTest;
+    log.enableStderr();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+    const vae_mod = @import("minimax_h3_vae.zig");
+    const w = envU32("MINIMAX_H3_ENC_W", 1312);
+    const h = envU32("MINIMAX_H3_ENC_H", 736);
+    const f = envU32("MINIMAX_H3_ENC_F", 22);
+
+    const bytes = blk: {
+        const fh = try std.Io.Dir.openFileAbsolute(io, raw_path, .{});
+        defer fh.close(io);
+        var rb: [1 << 16]u8 = undefined;
+        var rs = fh.reader(io, &rb);
+        break :blk try rs.interface.allocRemaining(a, .unlimited);
+    };
+    defer a.free(bytes);
+    const n: usize = @as(usize, f) * h * w * 3;
+    if (bytes.len < n) return error.ShortRawFile;
+    const px = try a.alloc(f32, n);
+    defer a.free(px);
+    // rgb24 [F,H,W,3] -> f32 [-1,1] laid out [1,3,F,H,W].
+    for (0..f) |fi| for (0..h) |y| for (0..w) |x| for (0..3) |c| {
+        const src = ((fi * h + y) * w + x) * 3 + c;
+        const dst = ((c * f + fi) * h + y) * w + x;
+        px[dst] = @as(f32, @floatFromInt(bytes[src])) / 127.5 - 1.0;
+    };
+    const shp = [_]c_int{ 1, 3, @intCast(f), @intCast(h), @intCast(w) };
+    const pixels = mlx.mlx_array_new_data(px.ptr, &shp, 5, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(pixels);
+
+    var vw = try model_mod.loadWeightsSingleFile(a, vae_path);
+    defer vw.deinit();
+
+    const Cfg = struct { name: []const u8, dt: mlx.mlx_dtype, tile: u32 };
+    const cfgs = [_]Cfg{
+        .{ .name = "f32/256 (reference)", .dt = .float32, .tile = 256 },
+        .{ .name = "f32/512", .dt = .float32, .tile = 512 },
+        .{ .name = "f32/768", .dt = .float32, .tile = 768 },
+        .{ .name = "bf16/256", .dt = .bfloat16, .tile = 256 },
+    };
+    // The meaningful score is the round trip: decode each latent and compare
+    // with the frames that went in. Two latents can differ and still decode
+    // to the same picture, so latent distance alone can't rank them.
+    var dec = try vae_mod.Decoder.load(a, &vw, .{}, mlx.mlx_dtype.bfloat16, s);
+    defer dec.deinit();
+    var ref: ?mlx.mlx_array = null;
+    defer if (ref) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    for (cfgs) |cfg| {
+        var enc = try vae_mod.Encoder.loadAs(a, &vw, cfg.dt, cfg.tile, s);
+        defer enc.deinit();
+        var clock = LapClock.init(io);
+        const lat = try enc.encodeVideo(pixels, a, s);
+        try mlx.check(mlx.mlx_array_eval(lat));
+        const ms = clock.lapMs();
+        _ = mlx.mlx_clear_cache();
+        const back = try vae_mod.decode(&dec, lat, a, s);
+        defer _ = mlx.mlx_array_free(back);
+        try mlx.check(mlx.mlx_array_eval(back));
+        const psnr = blk: {
+            const bshp = mlx.getShape(back);
+            const nf = @min(bshp[2], @as(c_int, @intCast(f)));
+            const bsl = try sliceFramesPub(back, 0, nf, s);
+            defer _ = mlx.mlx_array_free(bsl);
+            const psl = try sliceFramesPub(pixels, 0, nf, s);
+            defer _ = mlx.mlx_array_free(psl);
+            const m1 = try scalarLike(-1.0, psl, s);
+            defer _ = mlx.mlx_array_free(m1);
+            const np_ = try mulA(psl, m1, s);
+            defer _ = mlx.mlx_array_free(np_);
+            const bf = try astype(bsl, mlx.mlx_dtype.float32, s);
+            defer _ = mlx.mlx_array_free(bf);
+            const dd = try addA(bf, np_, s);
+            defer _ = mlx.mlx_array_free(dd);
+            const sq = try mulA(dd, dd, s);
+            defer _ = mlx.mlx_array_free(sq);
+            const mse = try meanAll(sq, s);
+            // [-1,1] range: peak-to-peak 2, so peak^2 = 4.
+            break :blk 10.0 * std.math.log10(4.0 / @max(mse, 1e-12));
+        };
+        _ = mlx.mlx_clear_cache();
+        std.debug.print("[enc-bench] {s}: round-trip PSNR vs input {d:.2} dB\n", .{ cfg.name, psnr });
+        if (ref == null) {
+            ref = lat;
+            std.debug.print("[enc-bench] {s}: {d} ms\n", .{ cfg.name, ms });
+            continue;
+        }
+        defer _ = mlx.mlx_array_free(lat);
+        // Relative RMS error against the reference latent, and whether
+        // anything went non-finite (an f16 overflow shows up as inf/nan).
+        const neg = try scalarLike(-1.0, ref.?, s);
+        defer _ = mlx.mlx_array_free(neg);
+        const nref = try mulA(ref.?, neg, s);
+        defer _ = mlx.mlx_array_free(nref);
+        const d = try addA(lat, nref, s);
+        defer _ = mlx.mlx_array_free(d);
+        const d2 = try mulA(d, d, s);
+        defer _ = mlx.mlx_array_free(d2);
+        const r2 = try mulA(ref.?, ref.?, s);
+        defer _ = mlx.mlx_array_free(r2);
+        const num = try meanAll(d2, s);
+        const den = try meanAll(r2, s);
+        const rel = @sqrt(num / @max(den, 1e-12));
+        std.debug.print("[enc-bench] {s}: {d} ms, rel-rms vs reference {d:.5}{s}\n", .{
+            cfg.name, ms, rel, if (std.math.isFinite(rel)) "" else "  NON-FINITE",
+        });
+    }
+}
+
+fn sliceFramesPub(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
+    return sliceFrames(x, lo, hi, s);
+}
+
+fn meanAll(x: mlx.mlx_array, s: S) !f32 {
+    var m = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(m);
+    try mlx.check(mlx.mlx_mean(&m, x, false, s));
+    try mlx.check(mlx.mlx_array_eval(m));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, m));
+    return v;
 }
