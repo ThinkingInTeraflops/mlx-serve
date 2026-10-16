@@ -4470,8 +4470,16 @@ fn generateOne(
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
         // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
-        const speed = req.speed;
-        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.turbo });
+        // Spectrum (opt-in, MINIMAX_H3_SPECTRUM): skips steps 2, 4 and 6 of
+        // every 8 and rebuilds them in a transformer-free replay — see
+        // `Spectrum`. It replaces the step cache and attention broadcast,
+        // which would otherwise skip on top of it. Never in a touch-up pass,
+        // whose short tail has nothing to forecast from.
+        const spec_on = spectrumEnabled() and req.init_start == 0 and req.steps >= 4;
+        const speed: SpeedConfig = if (spec_on) .{ .step_cache = 0, .bcast_k = 0 } else req.speed;
+        var spec: ?Spectrum = if (spec_on) try Spectrum.init(allocator, req.steps, video_x, audio_x, s) else null;
+        defer if (spec) |*sp| sp.deinit();
+        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (turbo={}, spectrum={})\n", .{ speed.step_cache, speed.bcast_k, req.turbo, spec_on });
         const bcast_k: u32 = speed.bcast_k;
         var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
@@ -4567,6 +4575,28 @@ fn generateOne(
                 log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (cached velocity, {d} ms)\n", .{ i + 1, req.steps, sigma, step_timer.lapMs() });
                 continue;
             }
+            if (spec) |*sp| if (spectrumSkips(i, req.steps) and sp.realCount(i) >= 1) {
+                // Pass 1: a Chebyshev extrapolation from the real steps so far
+                // stands in for the transformer (with a single real step,
+                // that's just its output held). The replay below rebuilds
+                // this step properly from both neighbours, so the forecast
+                // only has to keep the trajectory on course.
+                const fv = try sp.extrapolate(.video, i, s);
+                defer _ = mlx.mlx_array_free(fv);
+                const fa = try sp.extrapolate(.audio, i, s);
+                defer _ = mlx.mlx_array_free(fa);
+                try eulerAdvance(&video_x, fv, dsigma, s);
+                try eulerAdvance(&audio_x, fa, audioStepFactor(req.turbo, sigma, sigmas[i + 1], req.shift_video, req.shift_audio), s);
+                try mlx.check(mlx.mlx_array_eval(video_x));
+                try mlx.check(mlx.mlx_array_eval(audio_x));
+                sp.n_forecast += 1;
+                if (progress) |p| {
+                    if (p.boundary()) return error.Cancelled;
+                    p.emit("Generating", @intCast(i + 1), req.steps);
+                }
+                log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (spectrum forecast, {d} ms)\n", .{ i + 1, req.steps, sigma, step_timer.lapMs() });
+                continue;
+            };
             var plan = if (model.adaln_tables) |tt|
                 try buildTimestepPlanGlobal(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{}, tt.ts)
             else
@@ -4629,6 +4659,8 @@ fn generateOne(
             _ = mlx.mlx_array_free(audio_x);
             audio_x = na;
 
+            if (spec) |*sp| try sp.record(i, out.video, out.audio, s);
+
             if (sc_thresh > 0) {
                 const slope_f = timeShiftSlope(sigma, req.shift_video, req.shift_audio);
                 if (slope_f > 1e-9) {
@@ -4663,6 +4695,11 @@ fn generateOne(
             log.info("[minimax-h3] step-cache reused velocity on {d}/{d} steps (thresh {d:.3})\n", .{ sc_skipped, req.steps, sc_thresh });
         if (bcast_reused > 0)
             log.info("[minimax-h3] attn-broadcast reused attention on {d}/{d} steps (k={d})\n", .{ bcast_reused, req.steps, bcast_k });
+        if (spec) |*sp| if (sp.n_forecast > 0) {
+            var rt = LapClock.init(io);
+            try sp.replay(&video_x, &audio_x, sigmas, req, spectrumBlend(), s);
+            log.info("[minimax-h3] spectrum: forecast {d}/{d} steps, rebuilt in a transformer-free replay (spectral share {d:.2}, {d} ms)\n", .{ sp.n_forecast, req.steps, spectrumBlend(), rt.lapMs() });
+        };
     }
     _ = mlx.mlx_clear_cache();
     log.info("[minimax-h3] sampling done in {d} ms, DiT released\n", .{phase_timer.lapMs()});
@@ -4716,6 +4753,276 @@ fn generateOne(
         .width = @intCast(pshape[4]),
     };
 }
+
+// ── Spectrum: step forecasting with a transformer-free replay ──────────────
+//
+// A port of the pipe stack's forecaster (EtherReel `mlx_h3.py`,
+// `_SpectrumForecaster`) to the capture-and-replay shape the app's serve
+// controls describe. Pass 1 runs the schedule, but steps 2, 4 and 6 of every
+// 8 take a Chebyshev extrapolation from the real steps so far instead of a
+// forward, and every real step's output is kept. The replay then integrates
+// the whole schedule again from the original noise using the stored real
+// outputs, rebuilding each skipped step from BOTH neighbours: video as
+// `blend` * a ridge Chebyshev fit over every real step + (1 - blend) *
+// straight interpolation between the neighbours, audio by interpolation
+// alone. No transformer runs in the replay.
+//
+// Env: MINIMAX_H3_SPECTRUM (on unless empty or "0"), MINIMAX_H3_SPECTRUM_BLEND
+// (0-1, default 0.25: the spectral share).
+
+const SPECTRUM_ORDER: u32 = 3;
+const SPECTRUM_WINDOW: usize = 8; // real steps the pass-1 extrapolation fits
+const SPECTRUM_LAMBDA: f64 = 1e-3;
+
+fn spectrumEnabled() bool {
+    const v = envStr("MINIMAX_H3_SPECTRUM") orelse return false;
+    return v.len > 0 and !std.mem.eql(u8, v, "0");
+}
+
+fn spectrumBlend() f64 {
+    const v = envStr("MINIMAX_H3_SPECTRUM_BLEND") orelse return 0.25;
+    const b = std.fmt.parseFloat(f64, v) catch return 0.25;
+    return @max(0.0, @min(1.0, b));
+}
+
+/// Steps 2, 4 and 6 (1-based) of every block of 8 skip the transformer; the
+/// first and last step of the schedule always run.
+pub fn spectrumSkips(i: usize, steps: u32) bool {
+    if (i == 0 or i + 1 >= steps) return false;
+    const r = i % 8;
+    return r == 1 or r == 3 or r == 5;
+}
+
+/// Weights w such that sum_j w[j] * y[j] is the ridge-regularized Chebyshev
+/// fit (degree <= `order`) through points (xs[j], y[j]), evaluated at `x`.
+/// w = A (AᵀA + λI)⁻¹ a(x), A the Chebyshev Vandermonde of xs. Caller frees.
+pub fn chebWeights(allocator: std.mem.Allocator, xs: []const f64, x: f64, order: u32, lam: f64) ![]f64 {
+    const n = xs.len;
+    const deg: usize = @min(@as(usize, order), n - 1);
+    const m = deg + 1;
+    const cheb = struct {
+        fn row(out: []f64, t: f64) void {
+            out[0] = 1.0;
+            if (out.len > 1) out[1] = t;
+            var k: usize = 2;
+            while (k < out.len) : (k += 1) out[k] = 2.0 * t * out[k - 1] - out[k - 2];
+        }
+    }.row;
+    const a = try allocator.alloc(f64, n * m);
+    defer allocator.free(a);
+    for (xs, 0..) |xj, j| cheb(a[j * m .. (j + 1) * m], xj);
+    // Normal matrix, then solve (AᵀA + λI) z = a(x) by Gaussian elimination.
+    var g: [16]f64 = undefined; // m <= 4 (order 3)
+    var z: [4]f64 = undefined;
+    for (0..m) |r| {
+        for (0..m) |c| {
+            var acc: f64 = if (r == c) lam else 0;
+            for (0..n) |j| acc += a[j * m + r] * a[j * m + c];
+            g[r * m + c] = acc;
+        }
+    }
+    cheb(z[0..m], x);
+    for (0..m) |col| {
+        var piv = col;
+        for (col + 1..m) |r| if (@abs(g[r * m + col]) > @abs(g[piv * m + col])) {
+            piv = r;
+        };
+        if (piv != col) {
+            for (0..m) |c| std.mem.swap(f64, &g[col * m + c], &g[piv * m + c]);
+            std.mem.swap(f64, &z[col], &z[piv]);
+        }
+        const d = g[col * m + col];
+        for (col + 1..m) |r| {
+            const f = g[r * m + col] / d;
+            for (col..m) |c| g[r * m + c] -= f * g[col * m + c];
+            z[r] -= f * z[col];
+        }
+    }
+    var k = m;
+    while (k > 0) {
+        k -= 1;
+        var acc = z[k];
+        for (k + 1..m) |c| acc -= g[k * m + c] * z[c];
+        z[k] = acc / g[k * m + k];
+    }
+    const w = try allocator.alloc(f64, n);
+    for (0..n) |j| {
+        var acc: f64 = 0;
+        for (0..m) |r| acc += a[j * m + r] * z[r];
+        w[j] = acc;
+    }
+    return w;
+}
+
+/// x += v * scale, in place.
+fn eulerAdvance(x: *mlx.mlx_array, v: mlx.mlx_array, scale: f64, s: S) !void {
+    const sc = try scalarLike(@floatCast(scale), v, s);
+    defer _ = mlx.mlx_array_free(sc);
+    const st = try mulA(v, sc, s);
+    defer _ = mlx.mlx_array_free(st);
+    const nx = try addA(x.*, st, s);
+    _ = mlx.mlx_array_free(x.*);
+    x.* = nx;
+}
+
+/// sum_j w[j] * arrs[j]. New array.
+fn weightedSum(arrs: []const mlx.mlx_array, w: []const f64, s: S) !mlx.mlx_array {
+    var acc: ?mlx.mlx_array = null;
+    errdefer if (acc) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (arrs, w) |arr, wj| {
+        const sc = try scalarLike(@floatCast(wj), arr, s);
+        defer _ = mlx.mlx_array_free(sc);
+        const term = try mulA(arr, sc, s);
+        if (acc) |a| {
+            defer _ = mlx.mlx_array_free(term);
+            const nx = try addA(a, term, s);
+            _ = mlx.mlx_array_free(a);
+            acc = nx;
+        } else acc = term;
+    }
+    return acc.?;
+}
+
+const Spectrum = struct {
+    allocator: std.mem.Allocator,
+    steps: u32,
+    video: []?mlx.mlx_array, // real steps' velocities, by step
+    audio: []?mlx.mlx_array,
+    x0_video: mlx.mlx_array, // the starting noise, for the replay
+    x0_audio: mlx.mlx_array,
+    n_forecast: u32 = 0,
+
+    const Stream = enum { video, audio };
+
+    fn init(allocator: std.mem.Allocator, steps: u32, video_x: mlx.mlx_array, audio_x: mlx.mlx_array, s: S) !Spectrum {
+        const v = try allocator.alloc(?mlx.mlx_array, steps);
+        @memset(v, null);
+        const a = try allocator.alloc(?mlx.mlx_array, steps);
+        @memset(a, null);
+        const xv = try contig(video_x, s);
+        const xa = try contig(audio_x, s);
+        try mlx.check(mlx.mlx_array_eval(xv));
+        try mlx.check(mlx.mlx_array_eval(xa));
+        return .{ .allocator = allocator, .steps = steps, .video = v, .audio = a, .x0_video = xv, .x0_audio = xa };
+    }
+
+    fn deinit(self: *Spectrum) void {
+        for (self.video) |x| if (x) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (self.audio) |x| if (x) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        self.allocator.free(self.video);
+        self.allocator.free(self.audio);
+        _ = mlx.mlx_array_free(self.x0_video);
+        _ = mlx.mlx_array_free(self.x0_audio);
+    }
+
+    fn coord(self: *const Spectrum, i: usize) f64 {
+        return 2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(@max(self.steps - 1, 1))) - 1.0;
+    }
+
+    fn realCount(self: *const Spectrum, before: usize) usize {
+        var n: usize = 0;
+        for (self.video[0..before]) |x| {
+            if (x != null) n += 1;
+        }
+        return n;
+    }
+
+    fn record(self: *Spectrum, i: usize, v: mlx.mlx_array, a: mlx.mlx_array, s: S) !void {
+        const cv = try astype(v, mlx.mlx_dtype.float32, s);
+        const ca = try astype(a, mlx.mlx_dtype.float32, s);
+        try mlx.check(mlx.mlx_array_eval(cv));
+        try mlx.check(mlx.mlx_array_eval(ca));
+        self.video[i] = cv;
+        self.audio[i] = ca;
+    }
+
+    fn streamOf(self: *const Spectrum, which: Stream) []?mlx.mlx_array {
+        return if (which == .video) self.video else self.audio;
+    }
+
+    /// Pass 1: extrapolate step `i` from the last SPECTRUM_WINDOW real steps.
+    fn extrapolate(self: *Spectrum, which: Stream, i: usize, s: S) !mlx.mlx_array {
+        var xs: [SPECTRUM_WINDOW]f64 = undefined;
+        var ys: [SPECTRUM_WINDOW]mlx.mlx_array = undefined;
+        var n: usize = 0;
+        var j = i;
+        const hist = self.streamOf(which);
+        while (j > 0 and n < SPECTRUM_WINDOW) {
+            j -= 1;
+            if (hist[j]) |y| {
+                xs[n] = self.coord(j);
+                ys[n] = y;
+                n += 1;
+            }
+        }
+        const w = try chebWeights(self.allocator, xs[0..n], self.coord(i), SPECTRUM_ORDER, SPECTRUM_LAMBDA);
+        defer self.allocator.free(w);
+        return weightedSum(ys[0..n], w, s);
+    }
+
+    /// The transformer-free replay: re-integrate from the starting noise with
+    /// the stored real outputs, rebuilding each skipped step from its
+    /// neighbours.
+    fn replay(self: *Spectrum, video_x: *mlx.mlx_array, audio_x: *mlx.mlx_array, sigmas: []const f64, req: GenRequest, blend: f64, s: S) !void {
+        // Every real step, for the video's Chebyshev fit.
+        var real_x: std.ArrayList(f64) = .empty;
+        defer real_x.deinit(self.allocator);
+        var real_y: std.ArrayList(mlx.mlx_array) = .empty;
+        defer real_y.deinit(self.allocator);
+        for (self.video, 0..) |x, k| if (x) |y| {
+            try real_x.append(self.allocator, self.coord(k));
+            try real_y.append(self.allocator, y);
+        };
+
+        const nv = try contig(self.x0_video, s);
+        _ = mlx.mlx_array_free(video_x.*);
+        video_x.* = nv;
+        const na = try contig(self.x0_audio, s);
+        _ = mlx.mlx_array_free(audio_x.*);
+        audio_x.* = na;
+
+        for (0..self.steps) |i| {
+            const dsigma = sigmas[i + 1] - sigmas[i];
+            const afac = audioStepFactor(req.turbo, sigmas[i], sigmas[i + 1], req.shift_video, req.shift_audio);
+            if (self.video[i]) |v| {
+                try eulerAdvance(video_x, v, dsigma, s);
+                try eulerAdvance(audio_x, self.audio[i].?, afac, s);
+            } else {
+                var p = i;
+                while (p > 0 and self.video[p - 1] == null) p -= 1;
+                p -= 1; // previous real step (step 0 always runs)
+                var q = i + 1;
+                while (self.video[q] == null) q += 1; // next real (the last step always runs)
+                const t = @as(f64, @floatFromInt(i - p)) / @as(f64, @floatFromInt(q - p));
+                const lin_w = [_]f64{ 1.0 - t, t };
+                const lin_v = try weightedSum(&[_]mlx.mlx_array{ self.video[p].?, self.video[q].? }, &lin_w, s);
+                defer _ = mlx.mlx_array_free(lin_v);
+                const lin_a = try weightedSum(&[_]mlx.mlx_array{ self.audio[p].?, self.audio[q].? }, &lin_w, s);
+                defer _ = mlx.mlx_array_free(lin_a);
+                if (blend > 0) {
+                    const cw = try chebWeights(self.allocator, real_x.items, self.coord(i), SPECTRUM_ORDER, SPECTRUM_LAMBDA);
+                    defer self.allocator.free(cw);
+                    for (cw) |*c| c.* *= blend;
+                    const fit = try weightedSum(real_y.items, cw, s);
+                    defer _ = mlx.mlx_array_free(fit);
+                    const keep = [_]f64{ 1.0 - blend, 1.0 };
+                    const v = try weightedSum(&[_]mlx.mlx_array{ lin_v, fit }, &keep, s);
+                    defer _ = mlx.mlx_array_free(v);
+                    try eulerAdvance(video_x, v, dsigma, s);
+                } else try eulerAdvance(video_x, lin_v, dsigma, s);
+                try eulerAdvance(audio_x, lin_a, afac, s);
+            }
+            try mlx.check(mlx.mlx_array_eval(video_x.*));
+            try mlx.check(mlx.mlx_array_eval(audio_x.*));
+        }
+    }
+};
 
 // ── Draft + touch-up ────────────────────────────────────────────────────────
 
@@ -7898,4 +8205,42 @@ fn meanAll(x: mlx.mlx_array, s: S) !f32 {
     var v: f32 = 0;
     try mlx.check(mlx.mlx_array_item_float32(&v, m));
     return v;
+}
+
+test "minimax h3: spectrum skips 2, 4, 6 of every 8, never the first or last step" {
+    var skipped: [8]bool = undefined;
+    for (0..8) |i| skipped[i] = spectrumSkips(i, 8);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, true, false, true, false, false }, &skipped);
+    try std.testing.expect(!spectrumSkips(29, 30));
+    var n: u32 = 0;
+    for (0..30) |i| {
+        if (spectrumSkips(i, 30)) n += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 11), n);
+}
+
+test "minimax h3: chebyshev weights reproduce polynomials up to the order and sum to 1" {
+    const a = std.testing.allocator;
+    const xs = [_]f64{ -1.0, -0.6, -0.2, 0.2, 0.6 };
+    // Extrapolation and interpolation of a cubic, exact with tiny ridge.
+    for ([_]f64{ 0.9, 0.0 }) |x| {
+        const w = try chebWeights(a, &xs, x, 3, 1e-12);
+        defer a.free(w);
+        var sum: f64 = 0;
+        var fit: f64 = 0;
+        for (xs, w) |xj, wj| {
+            sum += wj;
+            fit += wj * (2.0 * xj * xj * xj - xj + 0.5);
+        }
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), sum, 1e-6);
+        try std.testing.expectApproxEqAbs(2.0 * x * x * x - x + 0.5, fit, 1e-6);
+    }
+    // One point holds its value; two degrade to a straight line.
+    const w1 = try chebWeights(a, &.{-0.5}, 0.0, 3, 1e-12);
+    defer a.free(w1);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w1[0], 1e-6);
+    const w2 = try chebWeights(a, &.{ -1.0, 0.0 }, 1.0, 3, 1e-12);
+    defer a.free(w2);
+    try std.testing.expectApproxEqAbs(@as(f64, -1.0), w2[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), w2[1], 1e-6);
 }
