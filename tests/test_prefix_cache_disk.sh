@@ -349,8 +349,8 @@ else
     HRESTART_MS="${HOUT2%%|*}"
     HCONTENT2="${HOUT2#*|}"
     echo "  restart total=${HRESTART_MS}ms (cold was ${HCOLD_MS}ms) content='${HCONTENT2:0:60}'"
-    if grep -qE '\[disk-cache\] restored .* from SSD .*\(ssm@[0-9]+\)' "$LOGFILE"; then
-        echo -e "${GREEN}PASS${NC} hybrid SSD restore engaged: $(grep -oE '\[disk-cache\] restored [^(]*\(ssm@[0-9]+\)' "$LOGFILE" | head -1)"
+    if grep -qE '\[disk-cache\] restored .* from SSD .*ssm@[0-9]+' "$LOGFILE"; then
+        echo -e "${GREEN}PASS${NC} hybrid SSD restore engaged: $(grep -oE '\[disk-cache\] restored [^(]*\([^)]*ssm@[0-9]+[^)]*\)' "$LOGFILE" | head -1)"
     else
         echo -e "${RED}FAIL${NC} hybrid: no '[disk-cache] restored … (ssm@…)' line after restart"
         tail -30 "$LOGFILE"; FAIL=1
@@ -596,6 +596,10 @@ else
         summary=$(grep -E '\[disk-cache\] shutdown persist:' "$LOGFILE" || true)
         if [ -n "$summary" ]; then
             echo -e "${GREEN}PASS${NC} $1: summary logged:$(echo "$summary" | sed 's/.*shutdown persist://')"
+            # The idle flush can finish both sessions before the signal; then SIGTERM wrote nothing.
+            if [ "$whole" = 2 ] && echo "$summary" | grep -qE 'persist: 0 written'; then
+                echo -e "${YELLOW}WARN${NC} $1: both sessions were whole before SIGTERM, so its write path did not run"
+            fi
         else
             echo -e "${RED}FAIL${NC} $1: no 'shutdown persist:' summary line"; FAIL=1
         fi
